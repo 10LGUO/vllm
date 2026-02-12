@@ -56,6 +56,10 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.pytorch_paged_ref import (
+    PYTORCH_PAGED_ATTN_ENABLED,
+    pytorch_paged_attention,
+)
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.cp_utils import (
@@ -1006,6 +1010,33 @@ class FlashAttentionImpl(AttentionImpl):
                         sliding_window_size is not None and sliding_window_size[1] >= 0
                     )
                     causal = not has_window
+
+                if PYTORCH_PAGED_ATTN_ENABLED:
+                    if (
+                        causal is not True
+                        or sliding_window_size is not None
+                        or self.alibi_slopes is not None
+                        or self.logits_soft_cap
+                        or self.sinks is not None
+                        or rswa_mask_mod_fn is not None
+                        or mm_mask_mod is not None
+                        or is_quantized_kv_cache(self.kv_cache_dtype)
+                    ):
+                        raise NotImplementedError(
+                            "VLLM_PYTORCH_PAGED_ATTN supports only the plain "
+                            "causal decoder path"
+                        )
+                    pytorch_paged_attention(
+                        output[:num_actual_tokens],
+                        query[:num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        cu_seqlens_q,
+                        seqused_k,
+                        block_table,
+                        self.scale,
+                    )
+                    return output
 
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
