@@ -1012,9 +1012,13 @@ class FlashAttentionImpl(AttentionImpl):
                     causal = not has_window
 
                 if PYTORCH_PAGED_ATTN_ENABLED:
+                    has_sliding_window = (
+                        sliding_window_size is not None
+                        and sliding_window_size[0] >= 0
+                    )
                     if (
                         causal is not True
-                        or sliding_window_size is not None
+                        or has_sliding_window
                         or self.alibi_slopes is not None
                         or self.logits_soft_cap
                         or self.sinks is not None
