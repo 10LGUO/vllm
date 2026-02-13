@@ -92,6 +92,80 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
+@pytest.mark.parametrize(
+    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
+)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@torch.inference_mode()
+def test_varlen_with_paged_kv_pytorch_reference(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    dtype: torch.dtype,
+    block_size: int,
+    num_blocks: int,
+) -> None:
+    """pytorch_paged_attention must match this suite's golden reference
+    (ref_paged_attn) on the plain causal path across the kernel's own
+    parameter matrix."""
+    from vllm.v1.attention.backends.pytorch_paged_ref import (
+        pytorch_paged_attention,
+    )
+
+    torch.set_default_device("cuda")
+    set_random_seed(0)
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    seqused_k = torch.tensor(kv_lens, dtype=torch.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
+    )
+
+    output = torch.empty_like(query)
+    pytorch_paged_attention(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        cu_query_lens,
+        seqused_k,
+        block_tables,
+        scale,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("use_out", [True, False])
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
