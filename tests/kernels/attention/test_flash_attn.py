@@ -166,6 +166,106 @@ def test_varlen_with_paged_kv_pytorch_reference(
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
+)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@torch.inference_mode()
+def test_varlen_with_paged_kv_pytorch_int8(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    dtype: torch.dtype,
+    block_size: int,
+    num_blocks: int,
+) -> None:
+    """pytorch_paged_attention_int8 must (a) exactly match the bf16 path run
+    on a pre-dequantized cache (dequant wiring), and (b) stay within a
+    bounded distance of the unquantized reference (per-channel INT8 loss)."""
+    from vllm.v1.attention.backends.pytorch_paged_ref import (
+        pytorch_paged_attention,
+        pytorch_paged_attention_int8,
+    )
+
+    torch.set_default_device("cuda")
+    set_random_seed(0)
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    seqused_k = torch.tensor(kv_lens, dtype=torch.int32)
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
+    )
+
+    # static per-channel scales from the full cache ("perfect calibration")
+    k_scale = key_cache.float().abs().amax(dim=(0, 1)).clamp_min(1e-8) / 127.0
+    v_scale = value_cache.float().abs().amax(dim=(0, 1)).clamp_min(1e-8) / 127.0
+    key_cache_int8 = (
+        (key_cache.float() / k_scale).round().clamp(-128, 127).to(torch.int8)
+    )
+    value_cache_int8 = (
+        (value_cache.float() / v_scale).round().clamp(-128, 127).to(torch.int8)
+    )
+
+    out_int8 = torch.empty_like(query)
+    pytorch_paged_attention_int8(
+        out_int8,
+        query,
+        key_cache_int8,
+        value_cache_int8,
+        k_scale,
+        v_scale,
+        cu_query_lens,
+        seqused_k,
+        block_tables,
+        scale,
+    )
+
+    key_cache_dq = (key_cache_int8.float() * k_scale).to(dtype)
+    value_cache_dq = (value_cache_int8.float() * v_scale).to(dtype)
+    out_dq = torch.empty_like(query)
+    pytorch_paged_attention(
+        out_dq,
+        query,
+        key_cache_dq,
+        value_cache_dq,
+        cu_query_lens,
+        seqused_k,
+        block_tables,
+        scale,
+    )
+    torch.testing.assert_close(out_int8, out_dq, atol=0.0, rtol=0.0)
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+    )
+    torch.testing.assert_close(out_int8, ref_output, atol=5e-2, rtol=5e-2)
+
+
 @pytest.mark.parametrize("use_out", [True, False])
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
