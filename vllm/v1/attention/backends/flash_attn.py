@@ -58,7 +58,12 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.pytorch_paged_ref import (
     PYTORCH_PAGED_ATTN_ENABLED,
+    PYTORCH_PAGED_ATTN_INT8_ENABLED,
+    get_layer_scales,
+    int8_cache_views,
+    int8_quantize_and_scatter,
     pytorch_paged_attention,
+    pytorch_paged_attention_int8,
 )
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -1011,7 +1016,7 @@ class FlashAttentionImpl(AttentionImpl):
                     )
                     causal = not has_window
 
-                if PYTORCH_PAGED_ATTN_ENABLED:
+                if PYTORCH_PAGED_ATTN_ENABLED or PYTORCH_PAGED_ATTN_INT8_ENABLED:
                     has_sliding_window = (
                         sliding_window_size is not None
                         and sliding_window_size[0] >= 0
@@ -1030,16 +1035,36 @@ class FlashAttentionImpl(AttentionImpl):
                             "VLLM_PYTORCH_PAGED_ATTN supports only the plain "
                             "causal decoder path"
                         )
-                    pytorch_paged_attention(
-                        output[:num_actual_tokens],
-                        query[:num_actual_tokens],
-                        key_cache,
-                        value_cache,
-                        cu_seqlens_q,
-                        seqused_k,
-                        block_table,
-                        self.scale,
-                    )
+                    if PYTORCH_PAGED_ATTN_INT8_ENABLED:
+                        key_cache_i8, value_cache_i8 = int8_cache_views(
+                            kv_cache, self.head_size
+                        )
+                        k_scale, v_scale = get_layer_scales(
+                            layer.layer_name, query.device
+                        )
+                        pytorch_paged_attention_int8(
+                            output[:num_actual_tokens],
+                            query[:num_actual_tokens],
+                            key_cache_i8,
+                            value_cache_i8,
+                            k_scale,
+                            v_scale,
+                            cu_seqlens_q,
+                            seqused_k,
+                            block_table,
+                            self.scale,
+                        )
+                    else:
+                        pytorch_paged_attention(
+                            output[:num_actual_tokens],
+                            query[:num_actual_tokens],
+                            key_cache,
+                            value_cache,
+                            cu_seqlens_q,
+                            seqused_k,
+                            block_table,
+                            self.scale,
+                        )
                     return output
 
                 flash_attn_varlen_func(
@@ -1110,6 +1135,17 @@ class FlashAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+
+        if PYTORCH_PAGED_ATTN_INT8_ENABLED:
+            key_cache_i8, value_cache_i8 = int8_cache_views(
+                kv_cache, self.head_size
+            )
+            k_scale, v_scale = get_layer_scales(layer.layer_name, key.device)
+            int8_quantize_and_scatter(
+                key, value, key_cache_i8, value_cache_i8, slot_mapping,
+                k_scale, v_scale,
+            )
             return
 
         # Scatter write into the KV cache using slot_mapping indices.

@@ -20,6 +20,74 @@ import os
 import torch
 
 PYTORCH_PAGED_ATTN_ENABLED = os.getenv("VLLM_PYTORCH_PAGED_ATTN", "0") == "1"
+PYTORCH_PAGED_ATTN_INT8_ENABLED = (
+    os.getenv("VLLM_PYTORCH_PAGED_ATTN_INT8", "0") == "1"
+)
+
+_scales_file: dict | None = None
+_scales_cache: dict = {}
+
+
+def get_layer_scales(
+    layer_name: str, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Loads static per-channel (k_scale, v_scale) for a layer from the
+    calibration file at $VLLM_KV_INT8_SCALES ({layer_idx: {"k_scale":
+    [num_kv_heads, head_size], "v_scale": ...}})."""
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    global _scales_file
+    idx = extract_layer_index(layer_name)
+    key = (idx, str(device))
+    if key not in _scales_cache:
+        if _scales_file is None:
+            _scales_file = torch.load(
+                os.environ["VLLM_KV_INT8_SCALES"], map_location="cpu"
+            )
+        entry = _scales_file[idx]
+        _scales_cache[key] = (
+            entry["k_scale"].float().to(device),
+            entry["v_scale"].float().to(device),
+        )
+    return _scales_cache[key]
+
+
+def int8_cache_views(
+    kv_cache: torch.Tensor, head_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reinterprets the engine's bf16 [num_blocks, num_kv_heads, block_size,
+    2 * head_size] cache storage as int8 code views [num_blocks, block_size,
+    num_kv_heads, head_size] for K and V. Only the front half of each row's
+    bytes is used; memory footprint is unchanged (capacity gains need the
+    CacheDType-level integration)."""
+    i8 = kv_cache.view(torch.int8)[..., : 2 * head_size]
+    key_cache, value_cache = i8.transpose(1, 2).split(head_size, dim=-1)
+    return key_cache, value_cache
+
+
+def int8_quantize_and_scatter(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    """Quantizes new K/V tokens with static per-channel scales and scatters
+    the int8 codes into the paged cache views (the write-side counterpart of
+    reshape_and_cache_flash)."""
+    block_size = key_cache.shape[1]
+    num_tokens = slot_mapping.shape[0]
+    slots = slot_mapping.long()
+    valid = slots >= 0
+    slots = slots[valid]
+    k = key[:num_tokens][valid].float()
+    v = value[:num_tokens][valid].float()
+    k_codes = (k / k_scale).round().clamp(-128, 127).to(torch.int8)
+    v_codes = (v / v_scale).round().clamp(-128, 127).to(torch.int8)
+    key_cache[slots // block_size, slots % block_size] = k_codes
+    value_cache[slots // block_size, slots % block_size] = v_codes
 
 
 def _paged_attention(
