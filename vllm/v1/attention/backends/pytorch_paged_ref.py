@@ -10,9 +10,13 @@ matrices). Supports the plain decoder path only: causal, no alibi, no
 sliding window, no soft cap, no sinks.
 
 pytorch_paged_attention_int8 is the INT8 variant: the paged cache holds int8
-codes with static per-channel scales [num_kv_heads, head_size]; codes are
-dequantized to the query dtype after the paged gather, mirroring a
-dequant-then-attend deployment.
+codes with static per-channel scales [num_kv_heads, head_size]. Rather than
+dequantizing K/V, it mirrors the integer-kernel design: K's per-channel
+scale is folded into Q before the QK contraction (legal because the scale
+is shared across tokens), and V's scale is applied after the PV contraction
+(legal because it varies along head_size, not the summed token axis). The
+codes themselves never get a scale applied elementwise -- prototyping the
+phase-2 int8 kernel semantics.
 """
 
 import os
@@ -106,6 +110,11 @@ def _paged_attention(
     num_q_heads = query.shape[1]
     group_size = num_q_heads // num_kv_heads
 
+    if k_scale is not None:
+        # expand per-kv-head scales to query heads once (GQA)
+        k_scale_q = k_scale.repeat_interleave(group_size, dim=0)
+        v_scale_q = v_scale.repeat_interleave(group_size, dim=0)
+
     query_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
     kv_lens = seqused_k.tolist()
 
@@ -121,23 +130,32 @@ def _paged_attention(
         v = value_cache[physical_blocks].reshape(-1, num_kv_heads, head_size)
         k, v = k[:kv_len], v[:kv_len]
 
-        if k_scale is not None:
-            k = (k.float() * k_scale).to(query.dtype)
-            v = (v.float() * v_scale).to(query.dtype)
-
         if group_size > 1:
             k = k.repeat_interleave(group_size, dim=1)
             v = v.repeat_interleave(group_size, dim=1)
 
-        scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * scale
+        q_f = q.float()
+        if k_scale is not None:
+            # fold K's per-channel scale into Q instead of dequantizing K:
+            # sum_d (q_d*s_kd)*code_d == sum_d q_d*(code_d*s_kd)
+            q_f = q_f * k_scale_q
+
+        scores = torch.einsum("qhd,khd->hqk", q_f, k.float()) * scale
 
         q_pos = torch.arange(q_len, device=query.device).unsqueeze(1)
         kv_pos = torch.arange(kv_len, device=query.device).unsqueeze(0)
         visible = kv_pos <= (kv_len - q_len) + q_pos
         scores = scores.masked_fill(~visible.unsqueeze(0), float("-inf"))
 
-        probs = torch.softmax(scores, dim=-1).to(v.dtype)
-        output[q_start : q_start + q_len] = torch.einsum("hqk,khd->qhd", probs, v)
+        probs = torch.softmax(scores, dim=-1)
+        if v_scale is None:
+            probs = probs.to(v.dtype)
+            out = torch.einsum("hqk,khd->qhd", probs, v)
+        else:
+            # V's per-channel scale is not on the summed (token) axis, so it
+            # factors out of the PV contraction and is applied once at the end
+            out = torch.einsum("hqk,khd->qhd", probs, v.float()) * v_scale_q
+        output[q_start : q_start + q_len] = out
         q_start += q_len
 
 
@@ -193,9 +211,10 @@ def pytorch_paged_attention_int8(
 
     key_cache/value_cache hold int8 codes in the same paged layout as the
     bf16 path; k_scale/v_scale are static per-channel fp32 scales of shape
-    [num_kv_heads, head_size] (code * scale ~= original value). Gathered
-    codes are dequantized to query.dtype, then attention proceeds
-    identically to pytorch_paged_attention.
+    [num_kv_heads, head_size] (code * scale ~= original value). K's scale is
+    folded into Q pre-contraction; V's scale is applied post-contraction.
+    The int8 codes are never elementwise-dequantized, matching the intended
+    integer-kernel design.
     """
     assert key_cache.dtype == torch.int8 and value_cache.dtype == torch.int8
     assert k_scale.shape == key_cache.shape[-2:], k_scale.shape

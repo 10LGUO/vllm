@@ -183,9 +183,11 @@ def test_varlen_with_paged_kv_pytorch_int8(
     block_size: int,
     num_blocks: int,
 ) -> None:
-    """pytorch_paged_attention_int8 must (a) exactly match the bf16 path run
-    on a pre-dequantized cache (dequant wiring), and (b) stay within a
-    bounded distance of the unquantized reference (per-channel INT8 loss)."""
+    """pytorch_paged_attention_int8 must (a) closely match the bf16 path run
+    on a pre-dequantized cache (scale wiring; not bitwise since the int8
+    path folds K's scale into Q and keeps fp32 through PV, avoiding the
+    bf16 materialization rounding), and (b) stay within a bounded distance
+    of the unquantized reference (per-channel INT8 loss)."""
     from vllm.v1.attention.backends.pytorch_paged_ref import (
         pytorch_paged_attention,
         pytorch_paged_attention_int8,
@@ -252,7 +254,7 @@ def test_varlen_with_paged_kv_pytorch_int8(
         block_tables,
         scale,
     )
-    torch.testing.assert_close(out_int8, out_dq, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(out_int8, out_dq, atol=1e-2, rtol=1e-2)
 
     ref_output = ref_paged_attn(
         query=query,
