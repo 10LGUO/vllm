@@ -9,14 +9,14 @@ Requires enforce_eager=True; slow by design (materializes full score
 matrices). Supports the plain decoder path only: causal, no alibi, no
 sliding window, no soft cap, no sinks.
 
-pytorch_paged_attention_int8 is the INT8 variant: the paged cache holds int8
-codes with static per-channel scales [num_kv_heads, head_size]. Rather than
-dequantizing K/V, it mirrors the integer-kernel design: K's per-channel
-scale is folded into Q before the QK contraction (legal because the scale
-is shared across tokens), and V's scale is applied after the PV contraction
-(legal because it varies along head_size, not the summed token axis). The
-codes themselves never get a scale applied elementwise -- prototyping the
-phase-2 int8 kernel semantics.
+pytorch_paged_attention_int8 simulates an INT8 attention kernel: Q is
+dynamically quantized per-channel at entry; the paged cache holds int8
+codes with static per-channel scales [num_kv_heads, head_size]. Since
+PyTorch has no int8 matmul ops, the int8 x int8 products are simulated as
+code.float() * scale dequantization followed by fp32 contractions --
+mirroring the arithmetic a real int8 kernel performs, with the fp32
+accumulate kept for the softmax. Output is cast back to the model dtype
+on the final write.
 """
 
 import os
@@ -30,6 +30,18 @@ PYTORCH_PAGED_ATTN_INT8_ENABLED = (
 
 _scales_file: dict | None = None
 _scales_cache: dict = {}
+
+
+def int8_quant_per_channel(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-channel INT8 quantization of [num_tokens, num_heads,
+    head_size]: one scale per (head, channel), shared across tokens.
+
+    Returns (codes int8, scale fp32 [num_heads, head_size])."""
+    scale = x.float().abs().amax(dim=0).clamp_min(1e-8) / 127.0
+    codes = (x.float() / scale).round().clamp(-128, 127).to(torch.int8)
+    return codes, scale
 
 
 def get_layer_scales(
@@ -140,6 +152,7 @@ def _paged_attention(
             # sum_d (q_d*s_kd)*code_d == sum_d q_d*(code_d*s_kd)
             q_f = q_f * k_scale_q
 
+        # p_ = q * k, fp32
         scores = torch.einsum("qhd,khd->hqk", q_f, k.float()) * scale
 
         q_pos = torch.arange(q_len, device=query.device).unsqueeze(1)
@@ -147,6 +160,7 @@ def _paged_attention(
         visible = kv_pos <= (kv_len - q_len) + q_pos
         scores = scores.masked_fill(~visible.unsqueeze(0), float("-inf"))
 
+        # p = softmax(p_), fp32
         probs = torch.softmax(scores, dim=-1)
         if v_scale is None:
             probs = probs.to(v.dtype)
@@ -207,21 +221,24 @@ def pytorch_paged_attention_int8(
     block_table: torch.Tensor,
     scale: float,
 ) -> None:
-    """Causal paged attention over an INT8-quantized KV cache.
+    """Causal paged attention simulating an INT8 kernel end to end.
 
-    key_cache/value_cache hold int8 codes in the same paged layout as the
-    bf16 path; k_scale/v_scale are static per-channel fp32 scales of shape
-    [num_kv_heads, head_size] (code * scale ~= original value). K's scale is
-    folded into Q pre-contraction; V's scale is applied post-contraction.
-    The int8 codes are never elementwise-dequantized, matching the intended
-    integer-kernel design.
+    Q is dynamically quantized per-channel here (q_int8, q_scale =
+    int8_quant(q)) and dequantized with its own scale; key_cache/value_cache
+    hold int8 codes with static per-channel fp32 scales [num_kv_heads,
+    head_size]. K's scale is folded into Q before the QK contraction and
+    V's scale is applied after the PV contraction, so the cached codes are
+    never elementwise-dequantized. Softmax stays fp32; output is cast to
+    the model dtype on the final write.
     """
     assert key_cache.dtype == torch.int8 and value_cache.dtype == torch.int8
     assert k_scale.shape == key_cache.shape[-2:], k_scale.shape
     assert v_scale.shape == value_cache.shape[-2:], v_scale.shape
+    q_codes, q_scale = int8_quant_per_channel(query)
+    q_deq = q_codes.float() * q_scale
     _paged_attention(
         output,
-        query,
+        q_deq,
         key_cache,
         value_cache,
         cu_seqlens_q,
