@@ -27,6 +27,9 @@ PYTORCH_PAGED_ATTN_ENABLED = os.getenv("VLLM_PYTORCH_PAGED_ATTN", "0") == "1"
 PYTORCH_PAGED_ATTN_INT8_ENABLED = (
     os.getenv("VLLM_PYTORCH_PAGED_ATTN_INT8", "0") == "1"
 )
+PYTORCH_PAGED_ATTN_INT8_DYNAMIC_ENABLED = (
+    os.getenv("VLLM_PYTORCH_PAGED_ATTN_INT8_DYNAMIC", "0") == "1"
+)
 
 _scales_file: dict | None = None
 _scales_cache: dict = {}
@@ -117,10 +120,12 @@ def _paged_attention(
     scale: float,
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
+    dynamic_kv_quant: bool = False,
 ) -> None:
     _, block_size, num_kv_heads, head_size = key_cache.shape
     num_q_heads = query.shape[1]
     group_size = num_q_heads // num_kv_heads
+    quantized = k_scale is not None or dynamic_kv_quant
 
     if k_scale is not None:
         # expand per-kv-head scales to query heads once (GQA)
@@ -142,12 +147,21 @@ def _paged_attention(
         v = value_cache[physical_blocks].reshape(-1, num_kv_heads, head_size)
         k, v = k[:kv_len], v[:kv_len]
 
+        if dynamic_kv_quant:
+            # pseudo-code flow: kvcache_int8, kvcache_scale = int8_quant(kv)
+            # -- scales derived from this sequence's gathered tokens at read
+            # time, no calibration file involved
+            k, seq_k_scale = int8_quant_per_channel(k)
+            v, seq_v_scale = int8_quant_per_channel(v)
+            k_scale_q = seq_k_scale.repeat_interleave(group_size, dim=0)
+            v_scale_q = seq_v_scale.repeat_interleave(group_size, dim=0)
+
         if group_size > 1:
             k = k.repeat_interleave(group_size, dim=1)
             v = v.repeat_interleave(group_size, dim=1)
 
         q_f = q.float()
-        if k_scale is not None:
+        if quantized:
             # fold K's per-channel scale into Q instead of dequantizing K:
             # sum_d (q_d*s_kd)*code_d == sum_d q_d*(code_d*s_kd)
             q_f = q_f * k_scale_q
@@ -162,13 +176,17 @@ def _paged_attention(
 
         # p = softmax(p_), fp32
         probs = torch.softmax(scores, dim=-1)
-        if v_scale is None:
+        if not quantized:
             probs = probs.to(v.dtype)
             out = torch.einsum("hqk,khd->qhd", probs, v)
         else:
             # V's per-channel scale is not on the summed (token) axis, so it
             # factors out of the PV contraction and is applied once at the end
             out = torch.einsum("hqk,khd->qhd", probs, v.float()) * v_scale_q
+        # `out` is fp32 in the quantized paths; the slice assignment below
+        # copies into the caller's preallocated buffer and casts to its
+        # dtype (bf16) in the same copy -- the pseudo-code's `.to(bf16)`
+        # without materializing an extra intermediate tensor
         output[q_start : q_start + q_len] = out
         q_start += q_len
 
@@ -247,4 +265,38 @@ def pytorch_paged_attention_int8(
         scale,
         k_scale.float(),
         v_scale.float(),
+    )
+
+
+def pytorch_paged_attention_int8_dynamic(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    scale: float,
+) -> None:
+    """Fully dynamic INT8 simulation, matching the pseudo-code flow exactly:
+    q_int8, q_scale = int8_quant(q); kvcache_int8, kvcache_scale =
+    int8_quant(kvcache). The cache stays bf16 (stock write path); each
+    sequence's gathered K/V is quantized per-channel at read time, so no
+    calibration file is needed. Validation tool for quantization loss --
+    a deployment path would use the static variant (frozen scales, int8
+    storage)."""
+    q_codes, q_scale = int8_quant_per_channel(query)
+    q_deq = q_codes.float() * q_scale
+    _paged_attention(
+        output,
+        q_deq,
+        key_cache,
+        value_cache,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        scale,
+        None,
+        None,
+        dynamic_kv_quant=True,
     )
