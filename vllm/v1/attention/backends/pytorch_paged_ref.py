@@ -24,9 +24,7 @@ import os
 import torch
 
 PYTORCH_PAGED_ATTN_ENABLED = os.getenv("VLLM_PYTORCH_PAGED_ATTN", "0") == "1"
-PYTORCH_PAGED_ATTN_INT8_ENABLED = (
-    os.getenv("VLLM_PYTORCH_PAGED_ATTN_INT8", "0") == "1"
-)
+PYTORCH_PAGED_ATTN_INT8_ENABLED = os.getenv("VLLM_PYTORCH_PAGED_ATTN_INT8", "0") == "1"
 PYTORCH_PAGED_ATTN_INT8_DYNAMIC_ENABLED = (
     os.getenv("VLLM_PYTORCH_PAGED_ATTN_INT8_DYNAMIC", "0") == "1"
 )
@@ -122,9 +120,12 @@ def _paged_attention(
     v_scale: torch.Tensor | None,
     dynamic_kv_quant: bool = False,
 ) -> None:
-    _, block_size, num_kv_heads, head_size = key_cache.shape
-    num_q_heads = query.shape[1]
+    _, block_size, num_kv_heads, head_size = (
+        key_cache.shape
+    )  # key_cache: [num_blocks, block_size, num_kv_heads, head_size]
+    num_q_heads = query.shape[1]  # query: [num_tokens, num_q_heads, head_size]
     group_size = num_q_heads // num_kv_heads
+    # if k_scale is not None -> static quantization (scale is the same for every sequence), if dynamic_kv_quant -> dynamic quantization.
     quantized = k_scale is not None or dynamic_kv_quant
 
     if k_scale is not None:
@@ -143,8 +144,13 @@ def _paged_attention(
 
         num_blocks_used = (kv_len + block_size - 1) // block_size
         physical_blocks = block_table[seq_idx, :num_blocks_used].long()
-        k = key_cache[physical_blocks].reshape(-1, num_kv_heads, head_size)
-        v = value_cache[physical_blocks].reshape(-1, num_kv_heads, head_size)
+        k = key_cache[physical_blocks].reshape(
+            -1, num_kv_heads, head_size
+        )  # k: [block_size * num_blocks_used, num_kv_heads, head_size]
+        v = value_cache[physical_blocks].reshape(
+            -1, num_kv_heads, head_size
+        )  # v: [block_size * num_blocks_used, num_kv_heads, head_size]
+        # trim the garbage value between [kv_len, block_size * num_blocks_used]
         k, v = k[:kv_len], v[:kv_len]
 
         if dynamic_kv_quant:
@@ -171,6 +177,9 @@ def _paged_attention(
 
         q_pos = torch.arange(q_len, device=query.device).unsqueeze(1)
         kv_pos = torch.arange(kv_len, device=query.device).unsqueeze(0)
+        # broadcast, compare the dimension of the two tensors one by one, if one dimension of a tensor is 1, 
+        # it will be broadcasted to the dimension of the other tensor.
+        # kv_pos[1,5] <= q_pos[2, 1] -> visible[2, 5] = True if elementwise comparison "<=" is true.
         visible = kv_pos <= (kv_len - q_len) + q_pos
         scores = scores.masked_fill(~visible.unsqueeze(0), float("-inf"))
 
